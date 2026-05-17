@@ -16,6 +16,12 @@ library(pheatmap)
 library (clusterProfiler)
 library(enrichplot)
 
+volcanoPCutoff <- .05
+volcanoFCcutoff <- 1
+enrichGOPCutoff <- .05
+enrichKEGGPCutoff <- .05
+enrichKEGGQCutoff <- .02
+
 # 数据读取与预处理
 mydata <- ReadAffy(celfile.path="/home/simone/microarrays/GSE24460") #把下载下来的.cel.gz文件转化为affybatch文件
 eset <- rma(mydata) #标准化
@@ -61,8 +67,8 @@ EnhancedVolcano(res, #取“res”为对象
                 title = '基因水平差异分析 (去重后)', # 标题
                 selectLab = top_genes, # 显示“top_genes”
                 drawConnectors = TRUE, # 当标签离点较远时，画一条直线连着，防止混淆
-                pCutoff = 0.05, # p=0.05
-                FCcutoff = 1.0) # 显示是否有差异的分界线为log2FC=1
+                pCutoff = volcanoPCutoff, # p=0.05
+                FCcutoff = volcanoFCcutoff) # 显示是否有差异的分界线为log2FC=1
 
 # pheatmap
 plot_matrix <- exp_matrix_gene[top_genes, ] # 创建矩阵“plot_matrix”，其为“exp_matrix_gene”中“top_genes”所对应的那些
@@ -88,14 +94,14 @@ ego <- enrichGO(gene          = geneID$ENTREZID, # 输入“geneID”
                 OrgDb         = org.Hs.eg.db, # 样本来自智人
                 ont           = "BP", # 在Biological Process（BP）层面分析
                 pAdjustMethod = "BH", # 使用Benjamini-Hochberg（BH）控制假阳性结果
-                pvalueCutoff  = 0.05) # 设定p=0.05
+                pvalueCutoff  = enrichGOPCutoff) # 设定p=0.05
 dotplot(ego, showCategory = 20) + ggtitle("GO Pathway Enrichment")# 生成名为“GO Pathway Enrichment”的GO的气泡图
 write.csv(as.data.frame(ego), "my_go_results.csv") # 生成一份名为ego的GO的csv文件
 
 # KEEG
 kk <- enrichKEGG(gene         = geneID$ENTREZID, # 输入“geneID”
                  organism     = 'hsa',   # 样本来自智人
-                 pvalueCutoff = 0.05, # 设定p=0.05
-                 qvalueCutoff = 0.2) # 多重假设检验矫正后的阈值=0.02
+                 pvalueCutoff = enrichKEGGPCutoff, # 设定p=0.05
+                 qvalueCutoff = enrichKEGGQCutoff) # 多重假设检验矫正后的阈值=0.02
 dotplot(kk, showCategory = 20) + ggtitle("KEGG Pathway Enrichment") # 生成名为"KEGG Pathway Enrichment"的KEEG气泡图
 write.csv(as.data.frame(kk), "my_kegg_results.csv") #生成一份名为kk的KEGG的csv文件
