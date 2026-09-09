@@ -1,107 +1,191 @@
-# 基础包
+# =============================================================================
+# GSE24460 差异表达分析（修订版，用于 PR）
+# 平台 GPL571 | 亲本 MCF-7 (Control)  vs  多柔比星耐药选育 MCF-7/ADR (Treat)
+#
+# 改动均以 [FIX-n] 标注，理由见对应 issue 与本 PR 描述。
+# 注意：本修订为 *源码级* 修复；请作者在自己的 R 环境里跑一遍确认数值。
+# =============================================================================
+
+# --- 基础包（保持原有依赖）---
 library(ggplot2)
 library(ggrepel)
 library(affy)
 library(hgu133a2.db)
 library(org.Hs.eg.db)
-# 数据质量检测包
 library(arrayQualityMetrics)
-# 数据处理包
 library(limma)
-# 火山图包
 library(EnhancedVolcano)
-# 热图包
 library(pheatmap)
-# 代谢分析包
-library (clusterProfiler)
+library(clusterProfiler)
 library(enrichplot)
 
-volcanoPCutoff <- .05
-volcanoFCcutoff <- 1
-enrichGOPCutoff <- .05
-enrichKEGGPCutoff <- .05
-enrichKEGGQCutoff <- .02
+# --- 阈值 ---
+# [FIX-1] 所有"显著性"判据统一改用 BH 校正后的 adj.P.Val（原文用 raw P.Value）。
+# 全基因组 ~46k 探针下 raw P<0.05 会放出约 2300 个假阳性；BH 控制 FDR。
+PAJ_CUTOFF   <- 0.05   # adj.P.Val 阈值
+VOLCANO_FC   <- 1      # 2 倍变化；x 轴是 logFC(=log2FC)，故 |log2FC|>1 == 2x（原文 1 正确）
+ENRICH_GO_P  <- 0.05
+ENRICH_KEGG_P <- 0.05
+ENRICH_KEGG_Q <- 0.02
 
-# 数据读取与预处理
-mydata <- ReadAffy(celfile.path="/home/simone/microarrays/GSE24460") #把下载下来的.cel.gz文件转化为affybatch文件
-eset <- rma(mydata) #标准化
-exp_matrix <- exprs(eset) # 原始探针水平矩阵
+# --- 数据读取与预处理 ---
+# ReadAffy 按*文件名字母序*排列列。本数据集字母序恰好 = 设计序（658 亲本,659 亲本,
+# 660 ADR,661 ADR），但这是命名巧合、不保证 —— 见下方 [FIX-4] 的显式校验。
+mydata <- ReadAffy(celfile.path = "/home/simone/microarrays/GSE24460")
+eset <- rma(mydata)
+exp_matrix <- exprs(eset)
+# [FIX-3] 原注释「原始探针水平矩阵」更正：rma() 之后 exprs() 是 *探针集水平、
+#         已 RMA 归一化/背景校正* 的矩阵；原始层在 mydata(AffyBatch) 里。
 
-# 数据质量检验
-arrayQualityMetrics (mydata,outdir="quality_assement") #在/home/simone生成quality_assement
+# --- 数据质量检验 ---
+# [FIX-2] outdir 拼写 assement -> assessment。
+arrayQualityMetrics(mydata, outdir = "quality_assessment")
+# [FIX-5] 原脚本跑完 QC 从不等看、直接从坏样本上继续，污染整组对比；且 2/2 设计
+#         里 1 个坏样本即毁掉对比。补 RMA 层 PCA + 相关热图，结果输出前强制人工确认。
+pdf("qc_pca_heatmap.pdf")
+pc <- prcomp(t(scale(t(exprs(eset)))))
+plot(pc$x[, 1:2], pch = 19, col = c("navy", "navy", "firebrick3", "firebrick3"),
+     xlab = "PC1", main = "PCA (RMA)")
+pheatmap(cor(exprs(eset)), labels_col = colnames(exprs(eset)),
+         main = "Sample correlation (RMA)")
+dev.off()
+message(">>> 请先查看 quality_assessment/index.html 与 qc_pca_heatmap.pdf，",
+        "确认无离群样本/无错标后再采信后续差异分析。")
 
-# 获取所有探针对应的 Symbol
-all_symbols <- mapIds(hgu133a2.db,  # 芯片型号
-                      keys = rownames(exp_matrix), #取exp_matrix的列名称为对象
-                      keytype = "PROBEID", # 把探针ID
-                      column = "SYMBOL")# 转换为基因名称（或者可以用GENENAME）
-                      #multiVals = "first") #这行是糊弄事的，如果想要糊弄甲方就可以用，然后就不用针对非特异性结合再数据处理了
+# --- 探针对应 Symbol ---
+all_symbols <- mapIds(hgu133a2.db,
+                      keys    = rownames(exp_matrix),
+                      keytype = "PROBEID",
+                      column  = "SYMBOL")
+# [FIX-6] 删除原"这行是糊弄事的/糊弄甲方"自嘲注释。
+# 去重策略见下：avereps 对同 Symbol 的多探针取均值（标准做法，但非最优，见 PR 讨论）。
 
-# 数据处理，针对潜在的探针非特异性结合造成的误差
-exp_matrix_gene <- avereps(exp_matrix, ID = all_symbols) # 使用 avereps 对表达矩阵按 Symbol 求平均
-exp_matrix_gene <- exp_matrix_gene[!is.na(rownames(exp_matrix_gene)), ] # 剔除掉没有 Symbol 的探针，并合并重复基因
+# --- 折叠到基因水平 ---
+exp_matrix_gene <- avereps(exp_matrix, ID = all_symbols)
+exp_matrix_gene <- exp_matrix_gene[!is.na(rownames(exp_matrix_gene)), ]
+message("折叠后基因数: ", nrow(exp_matrix_gene), " （原探针集数: ",
+        nrow(exp_matrix), "）")
 
-# 差异表达分析 (基于去重后的基因矩阵)
-group <- factor(c(rep("Control", 2), rep("Treat", 2))) # 2个对照组，2个实验组
-design <- model.matrix(~group) #生成“disign”这个矩阵
+# --- 分组 ---
+# [FIX-4] 原脚本 group <- factor(c(rep("Control",2), rep("Treat",2))) 硬编码
+#         "前 2 列 = 对照"，完全依赖 ReadAffy 的字母序列序，命名一旦不规范即静默错标。
+#         现从列名里的 GSM accession 推导并强校验，不符立即停止。
+gsm_id <- vapply(regmatches(colnames(exp_matrix_gene),
+                            regexec("^GSM[0-9]+", colnames(exp_matrix_gene))),
+                 function(m) m[[1]], character(1))
+known_gsm_id2group <- c("GSM602658" = "Control", "GSM602659" = "Control",
+                        "GSM602660" = "Treat",  "GSM602661" = "Treat")
+group <- factor(unname(known_gsm_id2group[match(gsm_id, names(known_gsm_id2group))]),
+                levels = c("Control", "Treat"))
+stopifnot(!any(is.na(group)),          # 每个样本都能映射到分组
+          nlevels(group) == 2,
+          sum(group == "Control") == 2, sum(group == "Treat") == 2)
+message("分组: ", paste(colnames(exp_matrix_gene), as.character(group),
+                        sep = "=", collapse = "  "))
 
-# 使用limma对去重后的矩阵进行线性拟合
-fit <- lmFit(exp_matrix_gene, design) # 输入“design”，将其赋值给“fit”
-fit <- eBayes(fit) # 用经验贝叶斯模型对“fit”进行处理
-res <- topTable(fit, coef=2, number=Inf) #生成数据框“res”，设定提取“fit”第2列对应的比较结果（组间差异），提取所有基因的计算结果（inf）
-res$Symbol <- rownames(res) # 在“res”中生成一个叫“res$Symbol”的新列，其显示基因名简称
+# --- 差异表达分析 ---
+# [FIX-7] 用显式 contrast 表达"ADR-亲本"，替代 magic coef=2；并把显著性落到 adj.P.Val。
+design <- model.matrix(~ 0 + group)
+colnames(design) <- levels(group)         # Control, Treat
+fit <- lmFit(exp_matrix_gene, design)
+fit <- contrasts.fit(fit, makeContrasts(Treat_Control = "Treat - Control",
+                                        levels = design))
+fit <- eBayes(fit)
+res <- topTable(fit, coef = "Treat_Control", number = Inf, adjust.method = "BH")
+res$Symbol <- rownames(res)
+res <- as.data.frame(res)
+# res 现含 logFC, AveExpr, t, P.Value, adj.P.Val
 
-# 给volcano map和pheat map筛选用于展示的 Top 基因 (从去重后的结果中选)
-res <- as.data.frame(res) # 将生成的对象强制转换为标准的数据框
-up_top10 <- head(res[order(res$P.Value), ], 100) # 按 P 值从小到大（最显著到最不显著）排序，取排序后的前 100 个基因作为候选
-up_top10 <- head(up_top10[up_top10$logFC > 0, ], 10)$Symbol # 在候选池中筛选出 logFC 大于 0 的基因，从这些上调基因中取前 10 个，只提取它们的基因名
-down_top10 <- head(res[order(res$P.Value), ], 100) # 同上
-down_top10 <- head(down_top10[down_top10$logFC < 0, ], 10)$Symbol #在候选池筛选出 logFC 小于 0 的基因，从这些上调基因中取前 10 个，只提取它们的基因名
-top_genes <- c(up_top10, down_top10) # 将两个字符向量（10 个上调 + 10 个下调）拼接在一起，生成向量“top_genes”
+# --- 展示用 Top 基因 ---
+# [FIX-1b] 选基因改用 adj.P.Val（原文用 raw P.Value）。
+# top_genes 仅用于图上打标签 / 热图选行，不替代完整差异分析。
+up_genes   <- res[res$adj.P.Val < PAJ_CUTOFF & res$logFC >  0, ]
+down_genes <- res[res$adj.P.Val < PAJ_CUTOFF & res$logFC <  0, ]
+up_top10   <- head(up_genes[order(up_genes$adj.P.Val), ], 10)
+down_top10 <- head(down_genes[order(down_genes$adj.P.Val), ], 10)
+top_genes  <- unique(c(up_top10$Symbol, down_top10$Symbol))
+# [FIX-8] 原脚本 head(...,100)[raw P 排序] 后再 head(...,10)：先按 raw P 切前 100
+#         再筛 FC>0 取 10，与"top10 上调/下调"意图不符、且基于 raw P；
+#         现改为先定 DEG(双阈值) 再按 adj.P.Val 取各方向最显著 10 个。
+message("Top 上调: ", paste(head(top_genes, 10), collapse=", "), "\n",
+        "Top 下调: ", paste(tail(top_genes, 10), collapse=", "))
 
-# volcanno map
-EnhancedVolcano(res, #取“res”为对象
-                lab = res$Symbol, # 指定图中每一个点对应的标签名
-                x = 'logFC', # 设置x轴为“logFC”
-                y = 'P.Value', # 设置y轴为“P.Value”
-                title = '基因水平差异分析 (去重后)', # 标题
-                selectLab = top_genes, # 显示“top_genes”
-                drawConnectors = TRUE, # 当标签离点较远时，画一条直线连着，防止混淆
-                pCutoff = volcanoPCutoff, # p=0.05
-                FCcutoff = volcanoFCcutoff) # 显示是否有差异的分界线为log2FC=1
+# --- 火山图 ---
+EnhancedVolcano(res,
+                lab = res$Symbol,
+                x = 'logFC',
+                y = 'P.Value',                  # 画 raw P（视觉更分散，常见美学选择）
+                title = 'Gene-level DE analysis (deduplicated)',
+                selectLab = top_genes,
+                drawConnectors = TRUE,
+                pCutoff = PAJ_CUTOFF,
+                pCutoffCol = 'adj.P.Val',       # [FIX-1] 显著性判据用 BH 校正 p，与 raw P 的 y 轴区分
+                FCcutoff = VOLCANO_FC)          # 2 倍变化（x 是 log2FC，故 |log2FC|>1）
 
-# pheatmap
-plot_matrix <- exp_matrix_gene[top_genes, ] # 创建矩阵“plot_matrix”，其为“exp_matrix_gene”中“top_genes”所对应的那些
-annotation_col <- data.frame(Group = group) # 创建一个注释条
-rownames(annotation_col) <- colnames(plot_matrix) # 注释条会在热图的最上方显示一排色块，标明哪些列是对照组，哪些是实验组
-bk <- c(seq(-2, -0.1, length.out=50), seq(0, 2, length.out=50))
-pheatmap(plot_matrix, # 取“plot_matrix”为对象
-         scale = "row", # 归一化              
-         clustering_distance_rows = "correlation", # 根据基因表达的相关性进行聚类，把表达模式相似的基因排在一起
-         annotation_col = annotation_col, 
+# --- 热图 ---
+plot_matrix <- exp_matrix_gene[top_genes, ]
+annotation_col <- data.frame(Group = as.character(group))
+rownames(annotation_col) <- colnames(plot_matrix)
+# [FIX-9] 原脚本 breaks 有断层: c(seq(-2,-0.1,50), seq(0,2,50)) 漏掉 (-0.1,0)，
+#         且 99 断点(98 区间) 配 100 色，颜色映射不可靠。改为连续、过 0、对称。
+nb <- 51
+bk   <- seq(-2, 2, length.out = nb)            # 51 断点 -> 50 区间
+colr <- colorRampPalette(c("navy", "white", "firebrick3"))(nb - 1)
+pheatmap(plot_matrix,
+         scale = "row",
+         clustering_distance_rows = "correlation",
+         annotation_col = annotation_col,
          breaks = bk,
-         color = colorRampPalette(c("navy", "white", "firebrick3"))(100), # 设置热图颜色
+         color = colr,
+         legend = TRUE,
          main = "Top DEGs Heatmap (Gene Level)")
 
-# 使用bitr将基因名转换为ID以便clusterProfiler后续处理（e.g.GO）
-geneID <- bitr(res$Symbol, # 创建变量“geneID”，以“res$Symbol”为其赋值
-      fromType="SYMBOL", # 将基因名简称
-      toType="ENTREZID", # 转换为ID
-       OrgDb = org.Hs.eg.db) # 样本来自智人
+# --- 生物学合理性自检 ---
+# [FIX-10] 本研究报道 MCF-7/ADR 相对亲本应上调 MDR/cSC 标志物。
+#          若这些基因没有按预期方向上调，说明上游(质控/分组/阈值)可能有问题。
+known_markers <- c("ABCB1", "CD44", "TGFB1", "SNAI1", "CCNE1", "MMP9")
+mk <- res[res$Symbol %in% known_markers, c("Symbol", "logFC", "adj.P.Val")]
+cat("\n已知 MDR/cSC 标志物（预期在 ADR 中上调）:\n")
+print(mk[order(mk$logFC, decreasing = TRUE), ])
+if (nrow(mk[mk$logFC > 0, ]) == 0)
+  warning("上述标志物无一上调，请回查分组方向 / 质控 / 阈值是否出错。")
 
-# GO
-ego <- enrichGO(gene          = geneID$ENTREZID, # 输入“geneID”
-                OrgDb         = org.Hs.eg.db, # 样本来自智人
-                ont           = "BP", # 在Biological Process（BP）层面分析
-                pAdjustMethod = "BH", # 使用Benjamini-Hochberg（BH）控制假阳性结果
-                pvalueCutoff  = enrichGOPCutoff) # 设定p=0.05
-dotplot(ego, showCategory = 20) + ggtitle("GO Pathway Enrichment")# 生成名为“GO Pathway Enrichment”的GO的气泡图
-write.csv(as.data.frame(ego), "my_go_results.csv") # 生成一份名为ego的GO的csv文件
+# --- 富集分析 ---
+# [FIX-11] 原脚本对 *全基因组所有基因* (res，number=Inf) 做 GO/KEGG 富集 ——
+#          把整个基因组当作"差异基因列表"，几乎必然得不到有意义结果。
+#          富集对象应限定为差异表达基因，且分上调 / 下调分别做。
+deg_up   <- res[res$adj.P.Val < PAJ_CUTOFF & res$logFC >  VOLCANO_FC, ]
+deg_down <- res[res$adj.P.Val < PAJ_CUTOFF & res$logFC < -VOLCANO_FC, ]
+geneID_up   <- bitr(deg_up$Symbol,   fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+geneID_down <- bitr(deg_down$Symbol, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+message("DEG: 上调 ", nrow(deg_up), "  下调 ", nrow(deg_down))
 
-# KEEG
-kk <- enrichKEGG(gene         = geneID$ENTREZID, # 输入“geneID”
-                 organism     = 'hsa',   # 样本来自智人
-                 pvalueCutoff = enrichKEGGPCutoff, # 设定p=0.05
-                 qvalueCutoff = enrichKEGGQCutoff) # 多重假设检验矫正后的阈值=0.02
-dotplot(kk, showCategory = 20) + ggtitle("KEGG Pathway Enrichment") # 生成名为"KEGG Pathway Enrichment"的KEEG气泡图
-write.csv(as.data.frame(kk), "my_kegg_results.csv") #生成一份名为kk的KEGG的csv文件
+# GO (BP)，上调/下调分开
+ego_up <- if (nrow(geneID_up) > 0)
+          enrichGO(gene = geneID_up$ENTREZID, OrgDb = org.Hs.eg.db, ont = "BP",
+                   pAdjustMethod = "BH", pvalueCutoff = ENRICH_GO_P) else NULL
+ego_dn <- if (nrow(geneID_down) > 0)
+          enrichGO(gene = geneID_down$ENTREZID, OrgDb = org.Hs.eg.db, ont = "BP",
+                   pAdjustMethod = "BH", pvalueCutoff = ENRICH_GO_P) else NULL
+pdf("go_bp.pdf")
+if (!is.null(ego_up)) print(dotplot(ego_up, showCategory = 20) + ggtitle("GO BP - Up"))
+if (!is.null(ego_dn)) print(dotplot(ego_dn, showCategory = 20) + ggtitle("GO BP - Down"))
+dev.off()
+if (!is.null(ego_up)) write.csv(as.data.frame(ego_up), "my_go_up_results.csv")
+if (!is.null(ego_dn)) write.csv(as.data.frame(ego_dn), "my_go_down_results.csv")
+
+# KEGG，上调/下调分开
+kk_up <- if (nrow(geneID_up) > 0)
+         enrichKEGG(gene = geneID_up$ENTREZID, organism = 'hsa',
+                    pvalueCutoff = ENRICH_KEGG_P, qvalueCutoff = ENRICH_KEGG_Q) else NULL
+kk_dn <- if (nrow(geneID_down) > 0)
+         enrichKEGG(gene = geneID_down$ENTREZID, organism = 'hsa',
+                    pvalueCutoff = ENRICH_KEGG_P, qvalueCutoff = ENRICH_KEGG_Q) else NULL
+pdf("kegg.pdf")
+if (!is.null(kk_up)) print(dotplot(kk_up, showCategory = 20) + ggtitle("KEGG - Up"))
+if (!is.null(kk_dn)) print(dotplot(kk_dn, showCategory = 20) + ggtitle("KEGG - Down"))
+dev.off()
+if (!is.null(kk_up)) write.csv(as.data.frame(kk_up), "my_kegg_up_results.csv")
+if (!is.null(kk_dn)) write.csv(as.data.frame(kk_dn), "my_kegg_down_results.csv")
+
+message(">>> 完成。")
